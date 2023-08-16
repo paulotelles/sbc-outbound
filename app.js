@@ -3,10 +3,37 @@ assert.ok(process.env.JAMBONES_MYSQL_HOST &&
   process.env.JAMBONES_MYSQL_USER &&
   process.env.JAMBONES_MYSQL_PASSWORD &&
   process.env.JAMBONES_MYSQL_DATABASE, 'missing JAMBONES_MYSQL_XXX env vars');
-assert.ok(process.env.JAMBONES_REDIS_HOST, 'missing JAMBONES_REDIS_HOST env var');
+if (process.env.JAMBONES_REDIS_SENTINELS) {
+  assert.ok(process.env.JAMBONES_REDIS_SENTINEL_MASTER_NAME,
+    'missing JAMBONES_REDIS_SENTINEL_MASTER_NAME env var, JAMBONES_REDIS_SENTINEL_PASSWORD env var is optional');
+} else {
+  assert.ok(process.env.JAMBONES_REDIS_HOST, 'missing JAMBONES_REDIS_HOST env var');
+}
 assert.ok(process.env.DRACHTIO_PORT || process.env.DRACHTIO_HOST, 'missing DRACHTIO_PORT env var');
 assert.ok(process.env.DRACHTIO_SECRET, 'missing DRACHTIO_SECRET env var');
 assert.ok(process.env.JAMBONES_NETWORK_CIDR || process.env.K8S, 'missing JAMBONES_NETWORK_CIDR env var');
+assert.ok(process.env.JAMBONES_TIME_SERIES_HOST, 'missing JAMBONES_TIME_SERIES_HOST env var');
+
+const JAMBONES_REDIS_SENTINELS = process.env.JAMBONES_REDIS_SENTINELS ? {
+  sentinels: process.env.JAMBONES_REDIS_SENTINELS.split(',').map((sentinel) => {
+    let host, port = 26379;
+    if (sentinel.includes(':')) {
+      const arr = sentinel.split(':');
+      host = arr[0];
+      port = parseInt(arr[1], 10);
+    } else {
+      host = sentinel;
+    }
+    return {host, port};
+  }),
+  name: process.env.JAMBONES_REDIS_SENTINEL_MASTER_NAME,
+  ...(process.env.JAMBONES_REDIS_SENTINEL_PASSWORD && {
+    password: process.env.JAMBONES_REDIS_SENTINEL_PASSWORD
+  }),
+  ...(process.env.JAMBONES_REDIS_SENTINEL_USERNAME && {
+    username: process.env.JAMBONES_REDIS_SENTINEL_USERNAME
+  })
+} : null;
 
 const Srf = require('drachtio-srf');
 const srf = new Srf('sbc-outbound');
@@ -17,6 +44,9 @@ const opts = Object.assign({
 }, {level: process.env.JAMBONES_LOGLEVEL || 'info'});
 const logger = require('pino')(opts);
 const {
+  writeCallCount,
+  writeCallCountSP,
+  writeCallCountApp,
   writeCdrs,
   queryCdrs,
   writeAlerts,
@@ -33,15 +63,18 @@ const setNameRtp = `${(process.env.JAMBONES_CLUSTER_ID || 'default')}:active-rtp
 const rtpServers = [];
 const {
   ping,
-  performLcr,
+  lookupOutboundCarrierForAccount,
   lookupAllTeamsFQDNs,
   lookupAccountBySipRealm,
   lookupAccountBySid,
   lookupAccountCapacitiesBySid,
   lookupSipGatewaysByCarrier,
-  lookupCarrierBySid
+  lookupCarrierBySid,
+  queryCallLimits,
+  lookupCarrierByAccountLcr
 } = require('@jambonz/db-helpers')({
   host: process.env.JAMBONES_MYSQL_HOST,
+  port: process.env.JAMBONES_MYSQL_PORT || 3306,
   user: process.env.JAMBONES_MYSQL_USER,
   password: process.env.JAMBONES_MYSQL_PASSWORD,
   database: process.env.JAMBONES_MYSQL_DATABASE,
@@ -54,30 +87,38 @@ const {
   incrKey,
   decrKey,
   retrieveSet,
-  isMemberOfSet
-} = require('@jambonz/realtimedb-helpers')({
-  host: process.env.JAMBONES_REDIS_HOST || 'localhost',
+  isMemberOfSet,
+} = require('@jambonz/realtimedb-helpers')(JAMBONES_REDIS_SENTINELS || {
+  host: process.env.JAMBONES_REDIS_HOST,
   port: process.env.JAMBONES_REDIS_PORT || 6379
 }, logger);
 
 const activeCallIds = new Map();
+const Emitter = require('events');
+const idleEmitter = new Emitter();
 
 srf.locals = {...srf.locals,
   stats,
+  writeCallCount,
+  writeCallCountSP,
+  writeCallCountApp,
   writeCdrs,
   writeAlerts,
   AlertType,
   queryCdrs,
   activeCallIds,
+  idleEmitter,
   dbHelpers: {
     ping,
-    performLcr,
+    lookupOutboundCarrierForAccount,
     lookupAllTeamsFQDNs,
     lookupAccountBySipRealm,
     lookupAccountBySid,
     lookupAccountCapacitiesBySid,
     lookupSipGatewaysByCarrier,
-    lookupCarrierBySid
+    lookupCarrierBySid,
+    queryCallLimits,
+    lookupCarrierByAccountLcr
   },
   realtimeDbHelpers: {
     createHash,
@@ -87,14 +128,13 @@ srf.locals = {...srf.locals,
     isMemberOfSet
   }
 };
-const {initLocals, checkLimits, route} = require('./lib/middleware')(srf, logger, {
-  host: process.env.JAMBONES_REDIS_HOST,
-  port: process.env.JAMBONES_REDIS_PORT || 6379
-});
+const {initLocals, checkLimits, route} = require('./lib/middleware')(srf, logger, redisClient);
+const ngProtocol = process.env.JAMBONES_NG_PROTOCOL || 'udp';
+const ngPort = process.env.RTPENGINE_PORT || ('udp' === ngProtocol ? 22222 : 8080);
 const {getRtpEngine, setRtpEngines} = require('@jambonz/rtpengine-utils')([], logger, {
-  emitter: stats,
+  //emitter: stats,
   dtmfListenPort: process.env.DTMF_LISTEN_PORT || 22225,
-  protocol: 'udp'
+  protocol: ngProtocol
 });
 srf.locals.getRtpEngine = getRtpEngine;
 
@@ -169,12 +209,12 @@ if (process.env.K8S || process.env.HTTP_PORT) {
 if ('test' !== process.env.NODE_ENV) {
   /* update call stats periodically */
   setInterval(() => {
-    stats.gauge('sbc.sip.calls.count', activeCallIds.size, ['direction:outbound']);
-  }, 5000);
+    stats.gauge('sbc.sip.calls.count', activeCallIds.size, ['direction:outbound',
+      `instance_id:${process.env.INSTANCE_ID || 0}`]);
+  }, 20000);
 }
 
 const lookupRtpServiceEndpoints = (lookup, serviceName) => {
-  logger.debug(`dns lookup for ${serviceName}..`);
   lookup(serviceName, {family: 4, all: true}, (err, addresses) => {
     if (err) {
       logger.error({err}, `Error looking up ${serviceName}`);
@@ -186,7 +226,7 @@ const lookupRtpServiceEndpoints = (lookup, serviceName) => {
       rtpServers.length = 0;
       Array.prototype.push.apply(rtpServers, addrs);
       logger.info({rtpServers}, 'rtpserver endpoints have been updated');
-      setRtpEngines(rtpServers.map((a) => `${a}:${process.env.RTPENGINE_PORT || 22222}`));
+      setRtpEngines(rtpServers.map((a) => `${a}:${ngPort}`));
     }
   });
 };
@@ -213,7 +253,7 @@ else {
       logger.debug({newArray, rtpServers}, 'getActiveRtpServers');
       if (!equalsIgnoreOrder(newArray, rtpServers)) {
         logger.info({newArray}, 'resetting active rtpengines');
-        setRtpEngines(newArray.map((a) => `${a}:${process.env.RTPENGINE_PORT || 22222}`));
+        setRtpEngines(newArray.map((a) => `${a}:${ngPort}`));
         rtpServers.length = 0;
         Array.prototype.push.apply(rtpServers, newArray);
       }
@@ -228,5 +268,21 @@ else {
 }
 
 pingMsTeamsGateways(logger, srf);
+
+process.on('SIGUSR2', handle.bind(null));
+process.on('SIGTERM', handle.bind(null));
+
+function handle(signal) {
+  logger.info(`got signal ${signal}`);
+  if (process.env.K8S) {
+    if (0 === activeCallIds.size) {
+      logger.info('exiting immediately since we have no calls in progress');
+      process.exit(0);
+    }
+    else {
+      idleEmitter.once('idle', () => process.exit(0));
+    }
+  }
+}
 
 module.exports = {srf};
